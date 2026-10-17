@@ -1,0 +1,21 @@
+# ---- 第三方二进制（ffmpeg/ffprobe 静态构建 + VMAF 模型，用户可自行下载）----
+tools/ffbin/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- 本地状态 / 凭证（登录 Cookie 绝不入库）----
+*.cookie
+*.cookies
+.ncm_*
+config_local.*
+
+# ---- 编辑器 / 系统 ----
+.DS_Store
+.idea/
+.vscode/
+*.swp
