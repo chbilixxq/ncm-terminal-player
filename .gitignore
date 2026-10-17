@@ -14,6 +14,9 @@ venv/
 .ncm_*
 config_local.*
 
+# ---- 默认下载目录（音乐文件不入库）----
+download/
+
 # ---- 编辑器 / 系统 ----
 .DS_Store
 .idea/

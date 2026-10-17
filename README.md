@@ -1,7 +1,7 @@
 # 网易云音乐 · 终端播放器
 
 一个**纯 Python 标准库**实现的网易云音乐命令行播放器：无 GUI、无第三方依赖、单文件启动，
-在终端里完成 **搜索、歌单、排行榜、每日推荐、私人 FM、扫码/密码登录、逐行歌词、播放队列** 等完整功能，
+在终端里完成 **搜索、歌单、排行榜、每日推荐、私人 FM、扫码/密码登录、逐行歌词、播放队列、歌曲下载** 等完整功能，
 并能根据终端尺寸自动在「宽屏双栏 / 中屏堆叠 / 窄屏极简」之间切换布局。
 
 **许可证：CC BY-NC-SA 4.0**（署名-非商业性使用-相同方式共享）——
@@ -26,12 +26,16 @@ python3 netease_player.py
 # 2) 查看参数
 python3 netease_player.py --help
 
-# 3) 离线自检（不需要联网：加密 / 排版 / 歌词 / 布局 / 二维码 / 按键解析）
+# 3) 离线自检（不需要联网：加密 / NCM 解密 / 排版 / 歌词 / 布局 / 二维码 / 按键解析）
 python3 netease_player.py --selftest
 
 # 4) 脚本 / 管道模式
 echo "search 海阔天空" | python3 netease_player.py --plain
 python3 netease_player.py -c "search 海阔天空" -c "play 1" --plain
+
+# 5) 下载当前歌曲 / 歌单（默认保存到程序目录下的 download/）
+python3 netease_player.py -c "search 海阔天空" -c "play 1" -c "download" --plain
+python3 netease_player.py -c "download pl 123456789" --plain
 ```
 
 ### 播放内核
@@ -75,6 +79,21 @@ backend auto                                 # 自动探测（默认）
 | `list` | 查看播放队列**全部歌曲**（▶ 为当前曲目；超出窗口自动全屏浏览） |
 | `list clear` | 一键清空播放队列并停止播放 |
 | `retry` | 重新加载当前歌曲（换源 / 换音质） |
+
+### 下载
+| 命令 | 说明 |
+| ---- | ---- |
+| `download`（`dl`） | **下载当前播放歌曲**到下载目录（已存在会自动跳过） |
+| `download <序号>` | 下载当前搜索结果 / 歌单 / 播放队列中的第 N 首 |
+| `download <歌曲ID>` / `download <关键词>` | 按歌曲 ID / 关键词下载单曲 |
+| `download all` | **下载当前歌单 / 搜索结果 / 播放队列中的全部歌曲** |
+| `download pl <序号｜歌单ID>` | 打开并下载指定歌单的全部歌曲 |
+| `download dir [路径]` | 查看 / 修改下载目录；`download dir default` 恢复默认 |
+
+> 下载默认保存到**程序所在目录的 `download/`**，文件名形如
+> `歌手 - 歌名.mp3`。音质跟随 `quality` 设置（`quality lossless` 会优先取无损 FLAC）。
+> 如果服务端下发的是网易云**专有 NCM 加密容器**，程序会先解密再落盘，并按真实内容
+> 输出 `.mp3` / `.flac` 等可直接播放的文件；无损音乐会保留 FLAC，不会二次转码。
 
 ### 发现音乐
 | 命令 | 说明 |
@@ -139,10 +158,13 @@ backend auto                                 # 自动探测（默认）
 
 | 文件 | 内容 |
 | ---- | ---- |
-| `config.json` | 音质 / 音量 / 播放模式 / 主题 / 内核偏好 |
+| `config.json` | 音质 / 音量 / 播放模式 / 主题 / 内核偏好 / 下载目录 |
 | `cookies.txt` | 登录凭证（Netscape cookie 格式，**请勿外传**） |
 | `device.json` | 设备标识（模拟客户端所需） |
 | `history.txt` | 命令历史 |
+
+下载目录默认是**程序所在目录下的 `download/`**，可用 `download dir <路径>` 修改
+（保存为 `config.json` 的 `download_dir`；该目录已加入 `.gitignore`）。
 
 环境变量：`NCM_CONFIG_DIR`（指定配置目录，便于便携部署 / 测试隔离）、
 `NO_COLOR`（禁用颜色）、`COLUMNS`/`LINES`（管道模式的布局）、
@@ -172,6 +194,18 @@ sudo apt install mpg123
 **提示“直连播放失败，改为下载到本地后播放”？**
 正常兜底：先把音频下载到缓存目录再播放，日志里会显示
 `使用本地缓存播放：xxxx.mp3`。
+
+**下载下来的文件是什么格式？会不会是加密的 NCM？**
+普通下载接口一般直接返回 mp3 / flac。若服务端返回的是 NCM 加密容器，
+程序会自动识别 `CTENFDAM` 文件头、用内置的纯标准库 AES-128-ECB 解密，
+并按真实音频内容保存为 `.mp3` / `.flac`（无损不转码）。因此下载目录里
+得到的都是可以直接双击播放的文件，不会留下 `.ncm` 加密文件。
+下载目录可用 `download dir` 查看、`download dir <路径>` 修改。
+
+**下载很慢 / 想批量下载歌单？**
+`download` 在后台任务里执行，不阻塞播放和界面（脚本模式的下载会等待完成再退出）。
+下载歌单用 `pl <序号>` 打开后 `download all`，或直接 `download pl <歌单ID>`；
+已经下载过的同名歌曲会自动跳过。
 
 **接口返回“操作过于频繁，被风控拦下了”？**
 短时间大量请求会被限流，稍等片刻再试；本程序已内置指数退避重试。
@@ -213,8 +247,10 @@ LICENSE                  # CC BY-NC-SA 4.0 完整法律文本 + 版权声明
 LICENSES/
   python-qrcode-BSD-3-Clause.txt   # 内嵌第三方组件的许可证副本
 README.md                # 本文档
+download/                # 默认下载目录（运行时创建，已 gitignore）
 tools/
   backend_test.py        # 真实播放后端测试（mpv / ffplay，各 11 项）
+  download_test.py       # 下载功能离线测试（NCM 解密/批量/目录，14 项）
   tui_sim_test.py        # 进程内 TUI 仿真测试（布局/命令/翻页/登录，44 项断言）
   tui_test.py            # 伪终端(PTY)驱动的端到端测试（26 项，需 /dev/ptmx）
   ffbin/                 # 可选：静态 ffmpeg（用于本地验证 ffplay 后端）
@@ -223,7 +259,8 @@ screenshots/             # 测试产生的屏幕快照
 ```
 
 ```bash
-python3 netease_player.py --selftest   # 离线自检（10 项）
+python3 netease_player.py --selftest   # 离线自检（11 项）
+python3 tools/download_test.py         # 下载功能离线测试（14 项）
 python3 tools/tui_sim_test.py          # TUI 仿真：布局/命令/翻页/登录（44 项）
 python3 tools/backend_test.py          # 真实后端：推进/暂停/跳转/自动切歌（11 项）
 python3 tools/tui_test.py              # PTY 端到端：真实终端/翻页/resize（26 项）
@@ -245,6 +282,9 @@ python3 tools/pty_size_test.py         # 诊断：PTY 尺寸传播与信号送�
   连续失败自动切换内核；后端通过统一抽象接入，`mpv` 走 IPC，`ffplay` 走
   SIGSTOP 暂停 + `-ss` 重启跳转 + 墙钟进度。
 * **歌词**：LRC 解析（多时间戳、offset 标签）、翻译/罗马音合并、按播放位置滚动高亮。
+* **下载**：`download` 支持当前歌曲 / 搜索结果 / 歌单批量下载；内置纯标准库
+  AES-128-ECB 与 NCM（`CTENFDAM`）解密，按解密后的真实文件头输出
+  `.mp3` / `.flac` 等可直接播放的格式，下载在后台任务中执行。
 * **二维码**：扫码登录的 QR 矩阵由内嵌的 `python-qrcode`（BSD-3-Clause，
   Copyright (c) 2011, Lincoln Loop）生成，用半块字符 `▀` + 黑白底色两行合一渲染。
 

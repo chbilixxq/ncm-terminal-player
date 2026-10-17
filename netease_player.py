@@ -15,6 +15,7 @@ netease_player.py —— 网易云音乐 · 终端播放器
 * 搜索（歌曲 / 歌手 / 专辑 / 歌单 / 歌词）、歌单、排行榜、每日推荐、私人 FM
 * 登录（扫码登录 + 账号密码登录），登录后可使用我的歌单 / 每日推荐 / 红心歌曲
 * 逐行同步歌词（含翻译、罗马音），进度条、音量、播放模式、队列管理
+* 歌曲下载：当前歌曲 / 歌单批量下载，自动解密 NCM 并输出可播放的 mp3/flac
 * 单文件启动，无需安装任何第三方依赖
 
 快捷开始
@@ -62,7 +63,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 # --------------------------------------------------------------------------
 
 APP_NAME = "网易云音乐终端播放器"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 API_HOST = "https://music.163.com"
 
@@ -366,6 +367,8 @@ def _build_sbox() -> bytes:
 
 
 _AES_SBOX = _build_sbox()
+# 逆 S 盒：解密 .ncm 需要 AES-128-ECB 解密
+_AES_INV_SBOX = bytes(_AES_SBOX.index(i) for i in range(256))
 
 _RCON = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1B, 0x36, 0x6C]
 
@@ -436,6 +439,89 @@ def _aes128_encrypt_block(block: bytes, round_keys: List[List[int]]) -> bytes:
     return bytes(state)
 
 
+def _aes128_decrypt_block(block: bytes, round_keys: List[List[int]]) -> bytes:
+    """解密一个 16 字节分组（AES-128 逆变换）。"""
+    state = list(block)
+    rk = round_keys[10]
+    for i in range(16):
+        state[i] ^= rk[i]
+
+    for rnd in range(9, 0, -1):
+        # InvShiftRows：第 r 行右移 r 位
+        state = [
+            state[0], state[13], state[10], state[7],
+            state[4], state[1], state[14], state[11],
+            state[8], state[5], state[2], state[15],
+            state[12], state[9], state[6], state[3],
+        ]
+        # InvSubBytes
+        for i in range(16):
+            state[i] = _AES_INV_SBOX[state[i]]
+        # AddRoundKey
+        rk = round_keys[rnd]
+        for i in range(16):
+            state[i] ^= rk[i]
+        # InvMixColumns
+        for c in range(4):
+            a0, a1, a2, a3 = state[c * 4:c * 4 + 4]
+            state[c * 4 + 0] = (_gf_mul(a0, 14) ^ _gf_mul(a1, 11)
+                                ^ _gf_mul(a2, 13) ^ _gf_mul(a3, 9))
+            state[c * 4 + 1] = (_gf_mul(a0, 9) ^ _gf_mul(a1, 14)
+                                ^ _gf_mul(a2, 11) ^ _gf_mul(a3, 13))
+            state[c * 4 + 2] = (_gf_mul(a0, 13) ^ _gf_mul(a1, 9)
+                                ^ _gf_mul(a2, 14) ^ _gf_mul(a3, 11))
+            state[c * 4 + 3] = (_gf_mul(a0, 11) ^ _gf_mul(a1, 13)
+                                ^ _gf_mul(a2, 9) ^ _gf_mul(a3, 14))
+
+    # 最后一轮：InvShiftRows + InvSubBytes + AddRoundKey
+    state = [
+        state[0], state[13], state[10], state[7],
+        state[4], state[1], state[14], state[11],
+        state[8], state[5], state[2], state[15],
+        state[12], state[9], state[6], state[3],
+    ]
+    for i in range(16):
+        state[i] = _AES_INV_SBOX[state[i]]
+    rk = round_keys[0]
+    for i in range(16):
+        state[i] ^= rk[i]
+    return bytes(state)
+
+
+def aes_ecb_encrypt(data: bytes, key: bytes, pad: bool = True) -> bytes:
+    """AES-128-ECB 加密（默认 PKCS#7 填充，用于自检构造测试样本）。"""
+    if pad:
+        pad_len = 16 - (len(data) % 16)
+        data = data + bytes([pad_len]) * pad_len
+    elif len(data) % 16:
+        raise ValueError("AES-ECB 数据长度必须是 16 的倍数")
+    round_keys = _aes128_expand_key(key)
+    return b"".join(
+        _aes128_encrypt_block(data[off:off + 16], round_keys)
+        for off in range(0, len(data), 16)
+    )
+
+
+def aes_ecb_decrypt(data: bytes, key: bytes, unpad: bool = True) -> bytes:
+    """AES-128-ECB 解密（默认去除 PKCS#7 填充）。
+
+    .ncm 的密钥块本身没有填充（长度恰为 16 的倍数），调用时传 unpad=False；
+    元数据块通常有 PKCS#7 填充，但解析时用 JSON 截断兜底。
+    """
+    if len(data) % 16:
+        raise ValueError("AES-ECB 数据长度必须是 16 的倍数")
+    round_keys = _aes128_expand_key(key)
+    out = b"".join(
+        _aes128_decrypt_block(data[off:off + 16], round_keys)
+        for off in range(0, len(data), 16)
+    )
+    if unpad and out:
+        pad_len = out[-1]
+        if 1 <= pad_len <= 16 and out.endswith(bytes([pad_len]) * pad_len):
+            out = out[:-pad_len]
+    return out
+
+
 def aes_cbc_encrypt(data: bytes, key: bytes, iv: bytes) -> bytes:
     """AES-128-CBC 加密（PKCS#7 填充）。"""
     pad_len = 16 - (len(data) % 16)
@@ -504,6 +590,298 @@ def selftest_crypto() -> bool:
     assert len(enc) == 16
     params, sec = weapi_encrypt({"type": 1})
     assert len(params) > 20 and len(sec) == 256
+    # 解密向量：与上面的 NIST 加密结果互为逆运算
+    dec = _aes128_decrypt_block(bytes.fromhex(cipher), rk)
+    assert dec == plain, dec.hex()
+    return True
+
+
+# --------------------------------------------------------------------------
+# 下载：NCM 解密 / 音频格式识别 / 文件名与目录处理
+# --------------------------------------------------------------------------
+
+AUDIO_EXTENSIONS = ("mp3", "flac", "m4a", "aac", "ogg", "wav")
+_AUDIO_FORMAT_ALIASES = {
+    "mp3": "mp3", "mpeg": "mp3", "mpeg3": "mp3",
+    "flac": "flac",
+    "m4a": "m4a", "mp4": "m4a", "alac": "m4a",
+    "aac": "aac",
+    "ogg": "ogg", "opus": "ogg",
+    "wav": "wav", "wave": "wav",
+}
+
+# 下载音质偏好直接沿用 QUALITY_LADDER（服务端按账号权限实际下发）
+MAX_DOWNLOAD_BYTES = 300 * 1024 * 1024       # 单曲上限 300MB（足够无损）
+NCM_MAGIC = b"CTENFDAM"
+NCM_KEY_PREFIX = b"neteasecloudmusic"
+NCM_META_PREFIX = b"163 key(Don't modify):"
+NCM_CORE_KEY = bytes.fromhex("687A4852416D736F356B496E62617857")
+NCM_META_KEY = bytes.fromhex("2331346C6A6B5F215C5D2630553C2728")
+
+
+class DownloadError(Exception):
+    """下载 / 解密过程中可展示给用户的错误。"""
+
+
+def default_download_dir() -> str:
+    """默认下载目录：程序所在目录下的 download/。"""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "download")
+
+
+def configured_download_dir(cfg: Any) -> str:
+    """读取配置里的下载目录；空值表示使用默认目录。"""
+    raw = str(cfg.get("download_dir", "") or "").strip()
+    if not raw:
+        return default_download_dir()
+    path = os.path.expanduser(raw)
+    if not os.path.isabs(path):
+        path = os.path.abspath(path)
+    return path
+
+
+def ensure_writable_dir(path: str) -> str:
+    """创建目录并确认可写；失败时抛 OSError。"""
+    os.makedirs(path, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=path, prefix=".ncm-write-",
+                                     delete=True) as fh:
+        fh.write(b"ok")
+    return path
+
+
+def sanitize_filename(name: Any, max_bytes: int = 180) -> str:
+    """把歌名/歌手变成安全的文件名（去掉路径分隔符与控制字符）。"""
+    text = str(name or "").strip()
+    text = re.sub(r"[\x00-\x1f\x7f/\\:*?\"<>|]+", "_", text)
+    text = re.sub(r"\s+", " ", text).strip().strip(" .")
+    if not text:
+        text = "未命名"
+    if len(text.encode("utf-8")) > max_bytes:
+        while text and len(text.encode("utf-8")) > max_bytes:
+            text = text[:-1]
+        text = text.rstrip(" .") or "未命名"
+    return text
+
+
+def normalize_audio_format(value: Any) -> str:
+    """把服务端 / NCM 元数据里的格式名规范成扩展名。"""
+    token = str(value or "").strip().lower().lstrip(".")
+    return _AUDIO_FORMAT_ALIASES.get(token, "")
+
+
+def audio_format_from_head(head: bytes) -> str:
+    """根据文件头判断音频格式（mp3/flac/m4a/aac/ogg/wav）。"""
+    if head.startswith(b"fLaC"):
+        return "flac"
+    if head.startswith(b"ID3"):
+        return "mp3"
+    if len(head) >= 12 and head[4:8] == b"ftyp":
+        return "m4a"
+    if head.startswith(b"OggS"):
+        return "ogg"
+    if len(head) >= 12 and head.startswith(b"RIFF") and head[8:12] == b"WAVE":
+        return "wav"
+    if len(head) >= 2 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0:
+        # ADTS AAC 与 MP3 的同步字相同，用 layer 位区分
+        return "aac" if (head[1] & 0x06) == 0 else "mp3"
+    return ""
+
+
+def download_format_hint(info: Dict[str, Any]) -> str:
+    """从下载接口返回的 type / URL 后缀推断格式。"""
+    fmt = normalize_audio_format(info.get("type"))
+    if fmt:
+        return fmt
+    path = urllib.parse.urlparse(str(info.get("url") or "")).path
+    return normalize_audio_format(os.path.splitext(path)[1])
+
+
+def quality_ladder(preferred: str = "exhigh") -> List[Tuple[str, int]]:
+    """返回从当前音质偏好开始的回退阶梯（去重码率）。"""
+    names = [name for name, _br in QUALITY_LADDER]
+    key = str(preferred or "exhigh").lower()
+    start = names.index(key) if key in names else names.index("exhigh")
+    out: List[Tuple[str, int]] = []
+    seen = set()
+    for name, br in QUALITY_LADDER[start:]:
+        if br in seen:
+            continue
+        seen.add(br)
+        out.append((name, br))
+    return out
+
+
+def _read_exact(fh: Any, size: int, what: str) -> bytes:
+    data = fh.read(size)
+    if len(data) != size:
+        raise DownloadError(f"NCM 文件不完整（{what}）")
+    return data
+
+
+def _read_u32(fh: Any, what: str) -> int:
+    raw = _read_exact(fh, 4, what)
+    return struct.unpack("<I", raw)[0]
+
+
+def _ncm_keybox(key_data: bytes) -> bytes:
+    """NCM 的 RC4 变体密钥盒。"""
+    if not key_data:
+        raise DownloadError("NCM 密钥为空")
+    box = bytearray(range(256))
+    c = 0
+    last_byte = 0
+    offset = 0
+    for i in range(256):
+        swap = box[i]
+        c = (swap + last_byte + key_data[offset]) & 0xFF
+        offset += 1
+        if offset >= len(key_data):
+            offset = 0
+        box[i] = box[c]
+        box[c] = swap
+        last_byte = c
+    return bytes(box)
+
+
+def _ncm_keystream(keybox: bytes) -> bytes:
+    """NCM 的 256 字节密钥流（每 256 字节循环一次）。"""
+    out = bytearray(256)
+    for n in range(1, 257):
+        j = n & 0xFF
+        out[n - 1] = keybox[(keybox[j] + keybox[(keybox[j] + j) & 0xFF]) & 0xFF]
+    return bytes(out)
+
+
+def _ncm_xor(data: bytes, keybox: bytes, offset: int = 0,
+              stream: Optional[bytes] = None) -> bytes:
+    """用 NCM 密钥流异或数据；大块用大整数异或，比逐字节循环快得多。"""
+    if not data:
+        return b""
+    stream = stream or _ncm_keystream(keybox)
+    if offset:
+        shift = offset % 256
+        stream = stream[shift:] + stream[:shift]
+    reps = (len(data) + 255) // 256
+    mask = (stream * reps)[:len(data)]
+    return (int.from_bytes(data, "big")
+            ^ int.from_bytes(mask, "big")).to_bytes(len(data), "big")
+
+
+def ncm_read_header(fh: Any) -> Tuple[Dict[str, Any], bytes]:
+    """读取并解密 NCM 头部，返回 (元数据, RC4 密钥)。"""
+    magic = fh.read(8)
+    if magic != NCM_MAGIC:
+        raise DownloadError("不是 NCM 文件")
+    _read_exact(fh, 2, "文件头")
+    key_len = _read_u32(fh, "密钥长度")
+    if not (0 < key_len <= 1 << 20):
+        raise DownloadError("NCM 密钥长度异常")
+    enc_key = _read_exact(fh, key_len, "密钥数据")
+    try:
+        key_plain = aes_ecb_decrypt(
+            bytes(b ^ 0x64 for b in enc_key), NCM_CORE_KEY, unpad=False)
+    except ValueError as exc:
+        raise DownloadError(f"NCM 密钥解密失败：{exc}") from exc
+    if not key_plain.startswith(NCM_KEY_PREFIX):
+        raise DownloadError("NCM 密钥校验失败（文件可能不是 NCM 或已损坏）")
+    key_data = key_plain[len(NCM_KEY_PREFIX):]
+    if not key_data:
+        raise DownloadError("NCM 密钥为空")
+
+    meta_len = _read_u32(fh, "元数据长度")
+    meta: Dict[str, Any] = {}
+    if meta_len:
+        if meta_len > 16 * 1024 * 1024:
+            raise DownloadError("NCM 元数据长度异常")
+        enc_meta = _read_exact(fh, meta_len, "元数据")
+        try:
+            raw = bytes(b ^ 0x63 for b in enc_meta)
+            if raw.startswith(NCM_META_PREFIX):
+                raw = raw[len(NCM_META_PREFIX):]
+            plain = aes_ecb_decrypt(base64.b64decode(raw), NCM_META_KEY,
+                                    unpad=False)
+            if plain.startswith(b"music:"):
+                plain = plain[len(b"music:"):]
+            text = plain.decode("utf-8", "ignore").rstrip("\x00")
+            end = text.rfind("}")
+            if end >= 0:
+                text = text[:end + 1]
+            if text:
+                parsed = safe_json(text, {})
+                if isinstance(parsed, dict):
+                    meta = parsed
+        except Exception:            # 元数据损坏不影响音频解密
+            meta = {}
+
+    _read_exact(fh, 4, "CRC")
+    _read_exact(fh, 5, "间隔区")
+    image_len = _read_u32(fh, "封面长度")
+    if image_len:
+        if image_len > 64 * 1024 * 1024:
+            raise DownloadError("NCM 封面数据异常")
+        _read_exact(fh, image_len, "封面数据")
+    return meta, key_data
+
+
+def ncm_extract(src_path: str, dst_path: str) -> Dict[str, Any]:
+    """把 NCM 文件解密成可直接播放的音频文件，返回其中的元数据。"""
+    with open(src_path, "rb") as fin:
+        meta, key_data = ncm_read_header(fin)
+        keybox = _ncm_keybox(key_data)
+        stream = _ncm_keystream(keybox)
+        total = 0
+        with open(dst_path, "wb") as fout:
+            while True:
+                chunk = fin.read(0x10000)      # 0x10000 是 256 的倍数
+                if not chunk:
+                    break
+                fout.write(_ncm_xor(chunk, keybox, 0, stream))
+                total += len(chunk)
+    if total < 1024:
+        raise DownloadError("NCM 解密后的音频内容过短")
+    return meta
+
+
+def selftest_ncm() -> bool:
+    """离线验证 NCM 解密（构造一个符合格式的加密样本）。"""
+    # 1) AES-128 解密向量
+    key = bytes(range(16))
+    cipher = bytes.fromhex("69c4e0d86a7b0430d8cdb78070b4c55a")
+    plain = bytes.fromhex("00112233445566778899aabbccddeeff")
+    assert _aes128_decrypt_block(cipher, _aes128_expand_key(key)) == plain
+
+    # 2) 构造 NCM：密钥块 + 元数据块 + 加密音频
+    audio = b"fLaC" + bytes((i * 7) & 0xFF for i in range(4096))
+    meta = {"format": "flac", "musicName": "测试歌曲", "artist": [["测试歌手", 1]]}
+    key_plain = NCM_KEY_PREFIX + bytes((i * 37 + 11) & 0xFF for i in range(111))
+    enc_key = bytes(b ^ 0x64 for b in aes_ecb_encrypt(
+        key_plain, NCM_CORE_KEY, pad=False))
+    meta_plain = b"music:" + json.dumps(meta, ensure_ascii=False).encode("utf-8")
+    meta_blob = NCM_META_PREFIX + base64.b64encode(
+        aes_ecb_encrypt(meta_plain, NCM_META_KEY, pad=True))
+    enc_meta = bytes(b ^ 0x63 for b in meta_blob)
+    enc_audio = _ncm_xor(audio, _ncm_keybox(key_plain[len(NCM_KEY_PREFIX):]))
+    blob = bytearray()
+    blob += NCM_MAGIC + b"\x00\x00"
+    blob += struct.pack("<I", len(enc_key)) + enc_key
+    blob += struct.pack("<I", len(enc_meta)) + enc_meta
+    blob += b"\x00" * 4 + b"\x00" * 5
+    blob += struct.pack("<I", 0)
+    blob += enc_audio
+
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "sample.ncm")
+        dst = os.path.join(tmp, "sample.flac")
+        with open(src, "wb") as fh:
+            fh.write(blob)
+        got_meta = ncm_extract(src, dst)
+        with open(dst, "rb") as fh:
+            decrypted = fh.read()
+        assert decrypted == audio, "NCM 解密结果与原音频不一致"
+        assert got_meta.get("format") == "flac", got_meta
+        assert got_meta.get("musicName") == "测试歌曲", got_meta
+        assert audio_format_from_head(decrypted[:16]) == "flac"
+    assert sanitize_filename('a/b:c*?"<>|') == "a_b_c_"
+    assert sanitize_filename("  ") == "未命名"
     return True
 
 
@@ -1176,6 +1554,41 @@ class NcmApi(NetEaseClient):
             if info and info.get("url"):
                 return info
         return {}
+
+    def song_download_url(self, song_id: int, br: int = 320000) -> Dict[str, Any]:
+        """官方下载接口；部分歌曲/账号不可用，失败返回空字典。"""
+        try:
+            res = self.request(
+                "/api/song/enhance/download/url",
+                {"id": int(song_id), "br": int(br)},
+            )
+            if res.get("code") not in (200, None):
+                return {}
+            data = res.get("data")
+            return data if isinstance(data, dict) else {}
+        except ApiError:
+            return {}
+
+    def resolve_download_info(self, song: Song, quality: str = "exhigh") -> Dict[str, Any]:
+        """解析下载地址：优先播放地址（稳定），再试官方下载接口，按音质回退。"""
+        fallback: Dict[str, Any] = {}
+        for _name, br in quality_ladder(quality):
+            try:
+                info = self.song_urls([song.id], br=br).get(song.id) or {}
+            except ApiError:
+                info = {}
+            if info.get("url"):
+                return info
+            if info and not fallback:
+                fallback = dict(info)
+        # 某些账号下播放接口不给地址，但官方下载接口可用
+        for _name, br in quality_ladder(quality):
+            info = self.song_download_url(song.id, br)
+            if info.get("url"):
+                return info
+            if info and not fallback:
+                fallback = dict(info)
+        return fallback
 
     def check_music(self, song_id: int, br: int = 999000) -> bool:
         info = self.song_urls([song_id], br=br).get(song_id)
@@ -2282,6 +2695,7 @@ class Config:
         "roman": False,           # 显示罗马音
         "page_size": 30,
         "show_queue": True,
+        "download_dir": "",       # 空 = 程序目录下的 download/
     }
 
     def __init__(self, cfg_dir: str):
@@ -3211,9 +3625,18 @@ class Application:
         self.pending_commands: List[str] = list(
             getattr(args, "command", None) or [])
         self._jobs: "queue.Queue[Tuple[str, Callable[[], Any]]]" = queue.Queue()
+        self._jobs_pending: int = 0
+        self._jobs_lock = threading.Lock()
         self._job_thread = threading.Thread(target=self._job_worker, daemon=True)
         self._job_thread.start()
         self._main_lock = threading.RLock()
+        # 当前打开的歌单（id, name），供 download pl 等命令使用
+        self.pl_meta: Optional[Tuple[int, str]] = None
+
+    @property
+    def download_dir(self) -> str:
+        """当前下载目录（默认程序目录 / download）。"""
+        return configured_download_dir(self.cfg)
 
     # -- 输出缓冲 ------------------------------------------------------
     def println(self, text: str = "", *styles: str) -> None:
@@ -3255,7 +3678,13 @@ class Application:
 
     # -- 后台任务 ------------------------------------------------------
     def run_job(self, name: str, fn: Callable[[], Any]) -> None:
+        with self._jobs_lock:
+            self._jobs_pending += 1
         self._jobs.put((name, fn))
+
+    def has_pending_jobs(self) -> bool:
+        with self._jobs_lock:
+            return self._jobs_pending > 0
 
     def _job_worker(self) -> None:
         while True:
@@ -3267,6 +3696,8 @@ class Application:
             except Exception as exc:      # 网络 / 解析异常兜底
                 self.error(f"{name}：{exc}")
             finally:
+                with self._jobs_lock:
+                    self._jobs_pending = max(0, self._jobs_pending - 1)
                 self.busy = ""
 
     # -- 事件泵 --------------------------------------------------------
@@ -4363,9 +4794,10 @@ class PlainUI:
                 else:
                     time.sleep(0.35)
                 self._tick()
-                # 输入结束后：若播放自然停稳（顺序播放到尾 / 无队列），即可退出
+                # 输入结束后：若播放自然停稳（顺序播放到尾 / 无队列）且没有
+                # 后台任务（例如 download），即可退出
                 if eof:
-                    if app.engine.state == "idle":
+                    if app.engine.state == "idle" and not app.has_pending_jobs():
                         idle_ticks += 1
                         if idle_ticks >= 3:
                             break
@@ -4376,6 +4808,209 @@ class PlainUI:
         finally:
             self._flush_messages()
             app.shutdown()
+
+
+# --------------------------------------------------------------------------
+# 下载器：把歌曲保存成可直接播放的本地文件（NCM 自动解密）
+# --------------------------------------------------------------------------
+
+class DownloadManager:
+    """下载单曲 / 歌单，负责格式识别、NCM 解密与文件命名。"""
+
+    def __init__(self, app: "Application", directory: str,
+                 quality: str = "exhigh"):
+        self.app = app
+        self.api = app.api
+        self.directory = directory
+        self.quality = quality
+        self.success = 0
+        self.skipped = 0
+        self.failed = 0
+        self.saved: List[str] = []
+
+    # -- 文件命名 ------------------------------------------------------
+    def _base_name(self, song: Song) -> str:
+        artists = "、".join(a for a in song.artists if a)
+        if artists:
+            name = f"{artists} - {song.name}"
+        else:
+            name = song.name or f"歌曲 {song.id}"
+        return sanitize_filename(name)
+
+    def _find_existing(self, song: Song) -> Optional[str]:
+        """按“歌手 - 歌名.扩展名”查找已下载的同名文件。"""
+        base = self._base_name(song)
+        for ext in AUDIO_EXTENSIONS:
+            path = os.path.join(self.directory, f"{base}.{ext}")
+            try:
+                if os.path.isfile(path) and os.path.getsize(path) > 4096:
+                    return path
+            except OSError:
+                pass
+        return None
+
+    def _target_path(self, song: Song, ext: str) -> str:
+        ext = normalize_audio_format(ext) or "mp3"
+        base = self._base_name(song)
+        path = os.path.join(self.directory, f"{base}.{ext}")
+        if not os.path.exists(path):
+            return path
+        try:
+            if os.path.getsize(path) <= 4096:      # 覆盖上次失败的残缺文件
+                return path
+        except OSError:
+            return path
+        for i in range(2, 1000):
+            cand = os.path.join(self.directory, f"{base} ({i}).{ext}")
+            if not os.path.exists(cand):
+                return cand
+        raise DownloadError("同名文件过多，无法生成目标文件名")
+
+    # -- 下载 ----------------------------------------------------------
+    def download(self, song: Song, index: int = 0,
+                 total: int = 0) -> Optional[str]:
+        """下载一首歌；已存在则跳过。失败抛 DownloadError。"""
+        prefix = f"[{index}/{total}] " if total > 1 else ""
+        existing = self._find_existing(song)
+        if existing:
+            self.skipped += 1
+            self.app.info(f"{prefix}已存在，跳过：{os.path.basename(existing)}")
+            return existing
+
+        resolver = getattr(self.api, "resolve_download_info", None)
+        info = resolver(song, self.quality) if callable(resolver) else {}
+        if not info or not info.get("url"):
+            # 兼容只实现播放地址解析的客户端（老版本 / 自定义后端）
+            try:
+                info = self.api.resolve_song_url(song)
+            except Exception:
+                info = {}
+        if not info or not info.get("url"):
+            raise DownloadError("没有可用的下载地址（版权 / VIP / 地区限制）")
+
+        trial_end = float(info.get("trial") or 0)
+        trial_info = info.get("freeTrialInfo")
+        if isinstance(trial_info, dict) and trial_info.get("end"):
+            trial_end = max(trial_end, float(trial_info.get("end") or 0))
+        if trial_end and song.duration_s and trial_end + 1 < song.duration_s:
+            self.app.warn(f"{prefix}该歌曲仅能下载试听片段（{int(trial_end)} 秒）")
+
+        self.app.busy = f"{prefix}下载 {song.name}…"
+        fd, temp_path = tempfile.mkstemp(prefix=".ncm-dl-", suffix=".part",
+                                         dir=self.directory)
+        os.close(fd)
+        size = 0
+        try:
+            resp = self.api.open_url(info["url"], timeout=30)
+            try:
+                try:
+                    total_hint = int(resp.headers.get("Content-Length") or 0)
+                except Exception:
+                    total_hint = 0
+                if total_hint > MAX_DOWNLOAD_BYTES:
+                    raise DownloadError("文件超过下载上限")
+                last_update = 0.0
+                with open(temp_path, "wb") as fh:
+                    while True:
+                        chunk = resp.read(64 * 1024)
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        if size > MAX_DOWNLOAD_BYTES:
+                            raise DownloadError("文件超过下载上限")
+                        fh.write(chunk)
+                        now = time.time()
+                        if now - last_update >= 0.5:
+                            last_update = now
+                            pct = (f" {int(size * 100 / total_hint)}%"
+                                   if total_hint else "")
+                            self.app.busy = f"{prefix}下载 {song.name}{pct}"
+            finally:
+                resp.close()
+            if size < 1024:
+                raise DownloadError("下载内容过短")
+            target, _meta = self._commit(song, temp_path, info)
+            temp_path = ""              # 已改名，不需要再清理
+        except DownloadError:
+            raise
+        except urllib.error.HTTPError as exc:
+            raise DownloadError(f"音乐服务器返回 HTTP {exc.code}") from exc
+        except (urllib.error.URLError, TimeoutError) as exc:
+            raise DownloadError(f"网络错误：{exc}") from exc
+        except OSError as exc:
+            raise DownloadError(f"写入文件失败：{exc}") from exc
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+
+        self.success += 1
+        self.saved.append(target)
+        self.app.ok(f"{prefix}已保存：{target}"
+                    f"（{human_size(os.path.getsize(target))}）")
+        return target
+
+    def _commit(self, song: Song, temp_path: str,
+                info: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        """检测 NCM 并解密，按真实音频格式落盘。"""
+        with open(temp_path, "rb") as fh:
+            head = fh.read(16)
+        if head.startswith(NCM_MAGIC):
+            dec_path = temp_path + ".dec"
+            try:
+                meta = ncm_extract(temp_path, dec_path)
+                with open(dec_path, "rb") as fh:
+                    dec_head = fh.read(16)
+                fmt = (audio_format_from_head(dec_head)
+                       or normalize_audio_format(meta.get("format"))
+                       or download_format_hint(info) or "mp3")
+                target = self._target_path(song, fmt)
+                os.replace(dec_path, target)
+            finally:
+                if os.path.exists(dec_path):
+                    try:
+                        os.remove(dec_path)
+                    except OSError:
+                        pass
+            self.app.info(
+                f"检测到 NCM 加密格式，已解密为 {fmt.upper()}："
+                f"{os.path.basename(target)}")
+            return target, meta
+
+        fmt = (audio_format_from_head(head)
+               or download_format_hint(info) or "mp3")
+        target = self._target_path(song, fmt)
+        os.replace(temp_path, target)
+        return target, {}
+
+    # -- 批量下载 ------------------------------------------------------
+    def download_many(self, songs: List[Song], title: str = "") -> None:
+        songs = [s for s in songs if s]
+        if not songs:
+            self.app.warn("没有可下载的歌曲")
+            return
+        ensure_writable_dir(self.directory)
+        label = f"「{title}」" if title else ""
+        self.app.info(f"开始下载{label}：共 {len(songs)} 首 → {self.directory}")
+        total = len(songs)
+        for i, song in enumerate(songs, 1):
+            try:
+                self.download(song, i, total)
+            except DownloadError as exc:
+                self.failed += 1
+                self.app.error(f"[{i}/{total}] 下载失败：{song.display()}（{exc}）")
+            except ApiError as exc:
+                self.failed += 1
+                self.app.error(f"[{i}/{total}] 下载失败：{song.display()}"
+                               f"（{exc.message}）")
+            except Exception as exc:          # 单曲失败不中断整张歌单
+                self.failed += 1
+                self.app.error(f"[{i}/{total}] 下载失败：{song.display()}（{exc}）")
+        if total > 1:
+            self.app.ok(f"下载结束：成功 {self.success}，跳过 {self.skipped}，"
+                        f"失败 {self.failed}（目录：{self.directory}）")
 
 
 # --------------------------------------------------------------------------
@@ -4522,6 +5157,7 @@ def cmd_help(app: Application, args: List[str], raw: str) -> None:
         ]),
         ("发现音乐", ["top", "pl", "artist", "album", "daily", "fm", "rec", "mine", "likes"]),
         ("歌词与信息", ["info", "lyric", "comment"]),
+        ("下载", ["download"]),
         ("账号", ["login", "logout", "me"]),
         ("界面与其它", ["clear", "view", "theme", "backend", "quality", "about",
                     "quit"]),
@@ -4550,6 +5186,7 @@ def cmd_about(app: Application, args: List[str], raw: str) -> None:
     app.heading(f"{APP_NAME} v{APP_VERSION}")
     app.println("纯 Python 标准库实现 · 无第三方依赖 · 终端交互", "white")
     app.println(f"配置目录：{app.cfg_dir}", "gray")
+    app.println(f"下载目录：{app.download_dir}", "gray")
     app.println(f"播放内核：{app.engine.backend_info()}", "gray")
     app.println(f"接口地址：{API_HOST}", "gray")
 
@@ -4720,6 +5357,207 @@ def cmd_retry(app: Application, args: List[str], raw: str) -> None:
     app.engine.retry()
 
 
+# -- 下载 ---------------------------------------------------------------
+
+def _download_dir_command(app: Application, rest: List[str]) -> None:
+    """查看 / 修改下载目录。"""
+    if not rest:
+        custom = bool(str(app.cfg.get("download_dir", "") or "").strip())
+        app.println(f"下载目录：{app.download_dir}"
+                    f"（{'自定义' if custom else '默认'}）")
+        app.println(f"下载音质：{app.cfg.get('quality', 'exhigh')}"
+                    "（用 quality 命令修改）", "gray")
+        app.println("修改：download dir <路径>；恢复默认：download dir default",
+                    "gray")
+        return
+    raw = " ".join(rest).strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "'\"":
+        raw = raw[1:-1].strip()
+    if raw.lower() in ("default", "reset", "默认", "恢复默认"):
+        default = default_download_dir()
+        try:
+            ensure_writable_dir(default)
+        except OSError as exc:
+            app.error(f"默认下载目录不可用：{default}（{exc}）")
+            return
+        app.cfg.set("download_dir", "")
+        app.ok(f"下载目录已恢复默认：{default}")
+        return
+    path = os.path.expanduser(raw)
+    if not os.path.isabs(path):
+        path = os.path.abspath(path)
+    if os.path.exists(path) and not os.path.isdir(path):
+        app.error(f"不是目录：{path}")
+        return
+    try:
+        ensure_writable_dir(path)
+    except OSError as exc:
+        app.error(f"无法使用该目录：{path}（{exc}）")
+        return
+    app.cfg.set("download_dir", path)
+    app.ok(f"下载目录已设为：{path}")
+
+
+def _download_playlist_command(app: Application, manager: DownloadManager,
+                               rest: List[str]) -> None:
+    """下载歌单：download pl [序号|歌单ID]。"""
+    if rest:
+        pid = resolve_playlist_id(app, rest[0])
+        app.busy = "读取歌单…"
+
+        def job() -> None:
+            meta, songs = app.api.playlist_tracks(pid)
+            name = str(meta.get("name") or f"歌单 {pid}")
+            manager.download_many(songs, name)
+
+        app.run_job("下载歌单", job)
+        return
+
+    res = app.results
+    if (res is not None and res.kind in SONG_KINDS and res.items
+            and app.pl_meta and res.query == app.pl_meta[1]):
+        songs = list(res.items)
+        name = app.pl_meta[1]
+        app.busy = f"下载歌单「{name}」…"
+        app.run_job("下载歌单",
+                    lambda: manager.download_many(songs, name))
+        return
+
+    if app.pl_meta and (res is None or res.query == app.pl_meta[1]):
+        pid, name = app.pl_meta
+        app.busy = f"下载歌单「{name}」…"
+
+        def job() -> None:
+            meta, songs = app.api.playlist_tracks(pid)
+            manager.download_many(songs, str(meta.get("name") or name))
+
+        app.run_job("下载歌单", job)
+        return
+
+    source = str(app.engine.queue_source or "")
+    if source.startswith("playlist:"):
+        try:
+            pid = int(source.split(":", 1)[1])
+        except ValueError:
+            pid = 0
+        if pid:
+            app.busy = "下载当前歌单…"
+            app.run_job("下载歌单",
+                        lambda: _download_playlist_by_id(app, manager, pid))
+            return
+    app.error("当前没有打开歌单：先 pl <序号|歌单ID>，"
+              "或直接 download pl <序号|歌单ID>")
+
+
+def _download_playlist_by_id(app: Application, manager: DownloadManager,
+                             pid: int) -> None:
+    meta, songs = app.api.playlist_tracks(pid)
+    name = str(meta.get("name") or f"歌单 {pid}")
+    manager.download_many(songs, name)
+
+
+@command("download", "下载当前歌曲 / 歌单（自动转为可播放格式）",
+         "download [当前 | 序号 | all | pl <序号|歌单ID> | dir [路径]]",
+         aliases=("dl", "下载"),
+         subcmds=["current", "all", "playlist", "dir"])
+def cmd_download(app: Application, args: List[str], raw: str) -> None:
+    if args and args[0].lower() in ("dir", "path", "folder", "directory",
+                                    "目录", "文件夹", "--dir", "-d"):
+        _download_dir_command(app, args[1:])
+        return
+
+    directory = app.download_dir
+    try:
+        ensure_writable_dir(directory)
+    except OSError as exc:
+        app.error(f"下载目录不可写：{directory}（{exc}）")
+        app.info("可用 download dir <路径> 指定其它目录")
+        return
+    quality = str(app.cfg.get("quality", "exhigh"))
+    manager = DownloadManager(app, directory, quality)
+
+    if not args:
+        song = app.engine.current
+        if not song:
+            app.error("当前没有正在播放的歌曲（先 play ...）")
+            return
+        app.busy = f"下载 {song.name}…"
+        app.run_job("下载",
+                    lambda: manager.download_many([song], song.display()))
+        return
+
+    token = args[0].lower()
+    if token in ("current", "song", "now", "当前", "本曲"):
+        return cmd_download(app, [], raw)
+
+    if token in ("all", "全部", "*", "queue", "list", "队列"):
+        res = app.results
+        if res is not None and res.kind == "playlist" and res.items:
+            app.error("当前是歌单列表：请用 download pl <序号|歌单ID> "
+                      "下载整个歌单")
+            return
+        songs, from_results = song_context(app)
+        if not songs:
+            app.error("当前列表和播放队列都是空的")
+            return
+        title = (str(res.query) if from_results and res and res.query
+                 else str(app.engine.queue_source or "当前列表"))
+        app.busy = f"下载 {len(songs)} 首…"
+        app.run_job("下载",
+                    lambda: manager.download_many(list(songs), title))
+        return
+
+    if token in ("pl", "playlist", "playlists", "歌单"):
+        _download_playlist_command(app, manager, args[1:])
+        return
+
+    if _big_id(args[0]):
+        song_id = int(args[0])
+        app.busy = "下载歌曲…"
+
+        def job_by_id() -> None:
+            songs = app.api.song_detail([song_id])
+            if not songs:
+                app.error(f"找不到歌曲 {song_id}")
+                return
+            manager.download_many([songs[0]], songs[0].display())
+
+        app.run_job("下载", job_by_id)
+        return
+
+    idx = _parse_pos(args[0])
+    if idx is not None:
+        songs, _from_results = song_context(app)
+        if not songs:
+            app.error("当前没有可下载的列表，先 search 或 play")
+            return
+        if not 1 <= idx <= len(songs):
+            app.error(f"序号超出范围（1-{len(songs)}）")
+            return
+        song = songs[idx - 1]
+        app.busy = f"下载 {song.name}…"
+        app.run_job("下载",
+                    lambda: manager.download_many([song], song.display()))
+        return
+
+    # 关键词：搜索并下载第一首
+    keyword = " ".join(args).strip()
+    if not keyword:
+        app.error("用法：download [当前 | 序号 | all | pl <序号|歌单ID> | "
+                  "dir [路径]]")
+        return
+    app.busy = f"搜索并下载「{keyword}」…"
+
+    def job_by_keyword() -> None:
+        res = app.api.search(keyword, "song", limit=1)
+        if not res.items:
+            app.error(f"没有搜到「{keyword}」")
+            return
+        manager.download_many([res.items[0]], res.items[0].display())
+
+    app.run_job("下载", job_by_keyword)
+
+
 @command("seek", "跳转进度", "seek <+秒 | -秒 | mm:ss | 百分比>", aliases=("跳转",))
 def cmd_seek(app: Application, args: List[str], raw: str) -> None:
     if not args:
@@ -4853,7 +5691,7 @@ def _open_playlist(app: Application, pid: int, extra: List[str]) -> None:
     name = str(meta.get("name") or f"歌单 {pid}")
     app.results = ResultSet(kind="tracks", items=songs, total=len(songs),
                             query=name)
-    app.pl_meta = (pid, name)     # type: ignore[attr-defined]
+    app.pl_meta = (pid, name)
     play_now = any(x in ("play", "播放", "go") for x in extra)
     header = f"{name} · {len(songs)} 首"
     freq = meta.get("updateFrequency")
@@ -7708,6 +8546,7 @@ def run_selftest() -> int:
     """离线自检：不需要联网即可验证核心算法。"""
     checks: List[Tuple[str, Callable[[], None]]] = [
         ("AES / weapi 加密（NIST 向量）", selftest_crypto),
+        ("NCM 解密 / 下载格式识别", selftest_ncm),
         ("全角宽度与排版", lambda: (
             assert_eq(disp_width("海阔天空 Beyond"), 15),
             assert_eq(disp_width("abc"), 3),
