@@ -296,3 +296,7 @@ python3 tools/pty_size_test.py         # 诊断：PTY 尺寸传播与信号送�
 * 本项目按"现状"提供，不附带任何明示或暗示的担保；因使用本项目产生的任何
   后果（含账号风控、封禁、数据损失等）由使用者自行承担。
 * 登录凭证（`cookies.txt` 等）属于你的账号机密，请勿外传或随代码分发。
+
+---
+
+本项目由Xiaomi Mimo 2.6 Flash 使用 Deepseek Harness构建
